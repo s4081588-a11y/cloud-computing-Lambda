@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MusicCloud Login</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+</head>
+<body class="bg-orbs">
+  <main class="page-center">
+    <section class="card">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <h1 id="brandTitle">MusicCloud</h1>
+      </div>
+
+      <h2 class="heading">Welcome Back</h2>
+      <p class="subheading">Sign in to manage your music subscriptions.</p>
+      <p class="note" id="endpointHint"></p>
+
+      <form id="loginForm">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+
+        <button class="btn-primary" type="submit">Login</button>
+      </form>
+
+      <div id="feedback" class="alert"></div>
+
+      <p class="helper-link">
+        New here? <a href="register.html">Create an account</a>
+      </p>
+    </section>
+  </main>
+
+  <script>
+    const appConfig = window.APP_CONFIG || {};
+    const form = document.getElementById("loginForm");
+    const feedback = document.getElementById("feedback");
+    const endpointHint = document.getElementById("endpointHint");
+    const brandTitle = document.getElementById("brandTitle");
+
+    brandTitle.textContent = appConfig.APP_TITLE || "MusicCloud";
+
+    function isLocalAddress(hostname) {
+      return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    }
+
+    function normalizeApiBase(input) {
+      const raw = (input || "").trim();
+      if (!raw) {
+        throw new Error("API base URL is missing in frontend/config.js");
+      }
+
+      let candidate = raw;
+      if (!/^https?:\/\//i.test(candidate)) {
+        candidate = `http://${candidate}`;
+      }
+
+      const parsed = new URL(candidate);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("Only HTTP or HTTPS API URLs are allowed.");
+      }
+
+      parsed.hash = "";
+      parsed.search = "";
+      return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, "");
+    }
+
+    function assertSecureApiBase(apiBase) {
+      const parsed = new URL(apiBase);
+      const local = isLocalAddress(parsed.hostname);
+      const allowHttp = Boolean(appConfig.ALLOW_HTTP_API);
+
+      if (window.location.protocol === "https:" && parsed.protocol !== "https:" && !local) {
+        throw new Error("Mixed content blocked: HTTPS frontend requires HTTPS API.");
+      }
+
+      if (parsed.protocol !== "https:" && !local && !allowHttp) {
+        throw new Error("For this architecture, configure an HTTPS API endpoint in config.js.");
+      }
+    }
+
+    async function parseJsonSafe(response) {
+      try {
+        return await response.json();
+      } catch {
+        return {};
+      }
+    }
+
+    async function secureFetch(apiBase, endpoint, method, payload) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      try {
+        const options = {
+          method,
+          mode: "cors",
+          cache: "no-store",
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          signal: controller.signal,
+          headers: {
+            "Accept": "application/json"
+          }
+        };
+
+        if (payload !== undefined) {
+          options.headers["Content-Type"] = "application/json";
+          options.body = JSON.stringify(payload);
+        }
+
+        return await fetch(`${apiBase}${endpoint}`, options);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    function setFeedback(message, type) {
+      feedback.className = `alert ${type}`;
+      feedback.textContent = message;
+    }
+
+    let apiBase = "";
+    try {
+      apiBase = normalizeApiBase(sessionStorage.getItem("apiBaseUrl") || appConfig.API_BASE_URL);
+      assertSecureApiBase(apiBase);
+      sessionStorage.setItem("apiBaseUrl", apiBase);
+      endpointHint.textContent = `API endpoint: ${apiBase}`;
+    } catch (error) {
+      setFeedback(error.message, "error");
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      if (!apiBase) {
+        setFeedback("API base URL is not configured.", "error");
+        return;
+      }
+
+      const email = document.getElementById("email").value.trim();
+      const password = document.getElementById("password").value;
+
+      try {
+        const res = await secureFetch(apiBase, "/api/login", "POST", { email, password });
+        const payload = await parseJsonSafe(res);
+
+        if (!res.ok) {
+          setFeedback(payload.message || "email or password is invalid", "error");
+          return;
+        }
+
+        sessionStorage.setItem("musicAppUser", JSON.stringify(payload.user));
+        window.location.href = "main.html";
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setFeedback("Login request timed out. Please try again.", "error");
+          return;
+        }
+        setFeedback("Unable to reach backend API.", "error");
+      }
+    });
+  </script>
+</body>
+</html>

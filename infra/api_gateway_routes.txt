@@ -1,0 +1,10 @@
+GET     /
+GET     /health
+GET     /api/health
+POST    /api/register
+POST    /api/login
+GET     /api/music
+GET     /api/subscriptions
+POST    /api/subscriptions
+DELETE  /api/subscriptions
+OPTIONS /{proxy+}

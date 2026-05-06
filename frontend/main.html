@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MusicCloud Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+  <style>
+    body { visibility: hidden; }
+  </style>
+  <script>
+    (function () {
+      const raw = sessionStorage.getItem("musicAppUser");
+      if (!raw) {
+        window.location.replace("login.html");
+        return;
+      }
+
+      try {
+        const user = JSON.parse(raw);
+        if (!user || !user.email) {
+          throw new Error("Invalid user session");
+        }
+        window.__SESSION_USER__ = user;
+      } catch {
+        sessionStorage.removeItem("musicAppUser");
+        window.location.replace("login.html");
+      }
+    })();
+  </script>
+</head>
+<body class="bg-orbs">
+  <main class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1 id="dashboardTitle">MusicCloud Dashboard</h1>
+        <p class="note">Search songs, subscribe, and manage your personal list.</p>
+      </div>
+      <div>
+        <span id="userBadge" class="badge"></span>
+        <button id="logoutBtn" class="btn-danger" type="button">Logout</button>
+      </div>
+    </header>
+
+    <section class="layout">
+      <article class="panel">
+        <h2 class="panel-title">Query Area</h2>
+        <p class="note">Enter at least one field to search songs.</p>
+
+        <form id="queryForm" class="inline-grid">
+          <div>
+            <label for="title">Title</label>
+            <input id="title" placeholder="e.g. Bad Blood">
+          </div>
+
+          <div>
+            <label for="artist">Artist</label>
+            <input id="artist" placeholder="e.g. Taylor Swift">
+          </div>
+
+          <div>
+            <label for="album">Album</label>
+            <input id="album" placeholder="e.g. 1989">
+          </div>
+
+          <div>
+            <label for="year">Year</label>
+            <input id="year" inputmode="numeric" placeholder="e.g. 2014">
+          </div>
+        </form>
+
+        <div class="panel-actions">
+          <button id="searchBtn" class="btn-primary" type="button">Query Songs</button>
+          <button id="clearBtn" class="btn-outline" type="button">Clear Fields</button>
+        </div>
+
+        <div id="searchFeedback" class="alert"></div>
+
+        <h3 class="panel-title">Results</h3>
+        <div id="results" class="song-grid"></div>
+      </article>
+
+      <aside class="panel">
+        <h2 class="panel-title">User Area</h2>
+        <p id="userInfo" class="note"></p>
+        <p id="apiInfo" class="note"></p>
+
+        <h3 class="panel-title">Subscription Area</h3>
+        <p class="note">Your currently subscribed songs.</p>
+        <div id="subFeedback" class="alert"></div>
+        <div id="subs" class="song-grid"></div>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const appConfig = window.APP_CONFIG || {};
+    const user = window.__SESSION_USER__;
+
+    function isLocalAddress(hostname) {
+      return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    }
+
+    function normalizeApiBase(input) {
+      const raw = (input || "").trim();
+      if (!raw) {
+        throw new Error("API base URL is missing in frontend/config.js");
+      }
+
+      let candidate = raw;
+      if (!/^https?:\/\//i.test(candidate)) {
+        candidate = `http://${candidate}`;
+      }
+
+      const parsed = new URL(candidate);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("Only HTTP or HTTPS API URLs are allowed.");
+      }
+
+      parsed.hash = "";
+      parsed.search = "";
+      return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, "");
+    }
+
+    function assertSecureApiBase(apiBase) {
+      const parsed = new URL(apiBase);
+      const local = isLocalAddress(parsed.hostname);
+      const allowHttp = Boolean(appConfig.ALLOW_HTTP_API);
+
+      if (window.location.protocol === "https:" && parsed.protocol !== "https:" && !local) {
+        throw new Error("Mixed content blocked: HTTPS frontend requires HTTPS API.");
+      }
+
+      if (parsed.protocol !== "https:" && !local && !allowHttp) {
+        throw new Error("For this architecture, configure an HTTPS API endpoint in config.js.");
+      }
+    }
+
+    function logout() {
+      sessionStorage.removeItem("musicAppUser");
+      window.location.href = "login.html";
+    }
+
+    function setMessage(element, message, type) {
+      element.className = `alert ${type}`;
+      element.textContent = message;
+    }
+
+    function clearMessage(element) {
+      element.className = "alert";
+      element.textContent = "";
+    }
+
+    function buildRequestOptions(method, payload, signal) {
+      const options = {
+        method,
+        mode: "cors",
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        signal,
+        headers: {
+          "Accept": "application/json"
+        }
+      };
+
+      if (payload !== undefined) {
+        options.headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(payload);
+      }
+
+      return options;
+    }
+
+    async function parseJsonSafe(response) {
+      try {
+        return await response.json();
+      } catch {
+        return {};
+      }
+    }
+
+    let apiBase = "";
+    let apiReady = false;
+
+    async function secureFetch(endpoint, method, payload) {
+      if (!apiReady) {
+        throw new Error("API is not configured securely.");
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      try {
+        return await fetch(`${apiBase}${endpoint}`, buildRequestOptions(method, payload, controller.signal));
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    function renderSongs(target, songs, actionLabel, onAction) {
+      target.innerHTML = "";
+
+      if (!songs.length) {
+        target.innerHTML = '<p class="note">No songs to display.</p>';
+        return;
+      }
+
+      songs.forEach((song) => {
+        const card = document.createElement("div");
+        card.className = "song-card";
+
+        const cover = document.createElement("img");
+        cover.className = "song-cover";
+        cover.alt = `${song.title} cover`;
+        cover.src = song.image_url || "https://placehold.co/400x300/e6ebef/12232f?text=No+Cover";
+        cover.loading = "lazy";
+        cover.decoding = "async";
+        cover.referrerPolicy = "no-referrer";
+
+        const body = document.createElement("div");
+        body.className = "song-body";
+
+        const title = document.createElement("div");
+        title.className = "song-title";
+        title.textContent = song.title;
+
+        const artist = document.createElement("div");
+        artist.className = "song-meta";
+        artist.textContent = `${song.artist} (${song.year})`;
+
+        const album = document.createElement("div");
+        album.className = "song-meta";
+        album.textContent = `Album: ${song.album || "N/A"}`;
+
+        const actions = document.createElement("div");
+        actions.className = "song-actions";
+
+        const button = document.createElement("button");
+        button.className = actionLabel === "Remove" ? "btn-danger" : "btn-outline";
+        button.type = "button";
+        button.textContent = actionLabel;
+        button.addEventListener("click", () => onAction(song));
+
+        actions.appendChild(button);
+        body.appendChild(title);
+        body.appendChild(artist);
+        body.appendChild(album);
+        body.appendChild(actions);
+        card.appendChild(cover);
+        card.appendChild(body);
+        target.appendChild(card);
+      });
+    }
+
+    async function checkApiHealth() {
+      const response = await secureFetch("/api/health", "GET");
+      return response.ok;
+    }
+
+    async function querySongs() {
+      const searchFeedback = document.getElementById("searchFeedback");
+      const resultsEl = document.getElementById("results");
+
+      const title = document.getElementById("title").value.trim();
+      const artist = document.getElementById("artist").value.trim();
+      const album = document.getElementById("album").value.trim();
+      const year = document.getElementById("year").value.trim();
+
+      if (!title && !artist && !album && !year) {
+        setMessage(searchFeedback, "At least one field is required to query songs.", "error");
+        return;
+      }
+
+      clearMessage(searchFeedback);
+      resultsEl.innerHTML = '<p class="loading">Loading songs...</p>';
+
+      const params = new URLSearchParams({ title, artist, album, year });
+
+      try {
+        const res = await secureFetch(`/api/music?${params.toString()}`, "GET");
+        const payload = await parseJsonSafe(res);
+
+        if (res.status === 401) {
+          logout();
+          return;
+        }
+
+        if (!res.ok) {
+          setMessage(searchFeedback, payload.message || "Search failed.", "error");
+          renderSongs(resultsEl, [], "Subscribe", () => {});
+          return;
+        }
+
+        if (!payload.length) {
+          setMessage(searchFeedback, "No result is retrieved. Please query again.", "error");
+          renderSongs(resultsEl, [], "Subscribe", () => {});
+          return;
+        }
+
+        clearMessage(searchFeedback);
+        renderSongs(resultsEl, payload, "Subscribe", subscribeSong);
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setMessage(searchFeedback, "Query timed out. Please try again.", "error");
+          renderSongs(resultsEl, [], "Subscribe", () => {});
+          return;
+        }
+        setMessage(searchFeedback, "Unable to query backend API.", "error");
+        renderSongs(resultsEl, [], "Subscribe", () => {});
+      }
+    }
+
+    async function subscribeSong(song) {
+      const subFeedback = document.getElementById("subFeedback");
+      clearMessage(subFeedback);
+
+      try {
+        const res = await secureFetch("/api/subscriptions", "POST", {
+          user_email: user.email,
+          title: song.title,
+          artist: song.artist,
+          year: song.year
+        });
+
+        const payload = await parseJsonSafe(res);
+
+        if (res.status === 401) {
+          logout();
+          return;
+        }
+
+        if (!res.ok) {
+          setMessage(subFeedback, payload.message || "Subscription failed.", "error");
+          return;
+        }
+
+        setMessage(subFeedback, "Song subscribed successfully.", "success");
+        await loadSubscriptions();
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setMessage(subFeedback, "Subscribe request timed out. Please try again.", "error");
+          return;
+        }
+        setMessage(subFeedback, "Unable to create subscription.", "error");
+      }
+    }
+
+    async function removeSubscription(song) {
+      const subFeedback = document.getElementById("subFeedback");
+      clearMessage(subFeedback);
+
+      try {
+        const res = await secureFetch("/api/subscriptions", "DELETE", {
+          user_email: user.email,
+          song_id: song.song_id
+        });
+
+        const payload = await parseJsonSafe(res);
+
+        if (res.status === 401) {
+          logout();
+          return;
+        }
+
+        if (!res.ok) {
+          setMessage(subFeedback, payload.message || "Failed to remove subscription.", "error");
+          return;
+        }
+
+        setMessage(subFeedback, "Subscription removed.", "success");
+        await loadSubscriptions();
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setMessage(subFeedback, "Remove request timed out. Please try again.", "error");
+          return;
+        }
+        setMessage(subFeedback, "Unable to remove subscription.", "error");
+      }
+    }
+
+    async function loadSubscriptions() {
+      const subFeedback = document.getElementById("subFeedback");
+      const subsEl = document.getElementById("subs");
+
+      subsEl.innerHTML = '<p class="loading">Loading subscriptions...</p>';
+
+      try {
+        const res = await secureFetch(`/api/subscriptions?email=${encodeURIComponent(user.email)}`, "GET");
+        const payload = await parseJsonSafe(res);
+
+        if (res.status === 401) {
+          logout();
+          return;
+        }
+
+        if (!res.ok) {
+          setMessage(subFeedback, payload.message || "Failed to load subscriptions.", "error");
+          renderSongs(subsEl, [], "Remove", () => {});
+          return;
+        }
+
+        clearMessage(subFeedback);
+        renderSongs(subsEl, payload, "Remove", removeSubscription);
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setMessage(subFeedback, "Subscription load timed out. Please try again.", "error");
+          renderSongs(subsEl, [], "Remove", () => {});
+          return;
+        }
+        setMessage(subFeedback, "Unable to load subscriptions.", "error");
+        renderSongs(subsEl, [], "Remove", () => {});
+      }
+    }
+
+    function clearQueryFields() {
+      document.getElementById("title").value = "";
+      document.getElementById("artist").value = "";
+      document.getElementById("album").value = "";
+      document.getElementById("year").value = "";
+      clearMessage(document.getElementById("searchFeedback"));
+    }
+
+    function unlockPage() {
+      document.body.style.visibility = "visible";
+    }
+
+    (async function init() {
+      if (!user || !user.email) {
+        logout();
+        return;
+      }
+
+      document.getElementById("dashboardTitle").textContent = `${appConfig.APP_TITLE || "MusicCloud"} Dashboard`;
+      document.getElementById("userBadge").textContent = `${user.username || "User"} • ${user.email}`;
+      document.getElementById("userInfo").textContent = `Logged in as ${user.username || "User"} (${user.email})`;
+
+      try {
+        apiBase = normalizeApiBase(sessionStorage.getItem("apiBaseUrl") || appConfig.API_BASE_URL);
+        assertSecureApiBase(apiBase);
+        apiReady = true;
+        sessionStorage.setItem("apiBaseUrl", apiBase);
+        document.getElementById("apiInfo").textContent = `API endpoint: ${apiBase}`;
+      } catch (error) {
+        setMessage(document.getElementById("searchFeedback"), error.message, "error");
+        setMessage(document.getElementById("subFeedback"), error.message, "error");
+        unlockPage();
+        return;
+      }
+
+      document.getElementById("logoutBtn").addEventListener("click", logout);
+      document.getElementById("searchBtn").addEventListener("click", querySongs);
+      document.getElementById("clearBtn").addEventListener("click", clearQueryFields);
+
+      unlockPage();
+
+      try {
+        const healthy = await checkApiHealth();
+        if (!healthy) {
+          setMessage(document.getElementById("searchFeedback"), "Backend health check failed.", "error");
+          return;
+        }
+        await loadSubscriptions();
+      } catch (error) {
+        setMessage(document.getElementById("searchFeedback"), "Unable to reach backend API.", "error");
+      }
+    })();
+  </script>
+</body>
+</html>
