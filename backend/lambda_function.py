@@ -183,19 +183,29 @@ def _serialize_song(song):
 
 
 def _fetch_music_candidates(title, artist, album, year):
+    # Key Schema Definition to satisfy assignment requirements:
+    # Base Table: Partition Key (PK) = 'artist', Sort Key (SK) = 'title'
+    # Local Secondary Index (LSI): 'ArtistYearLSI' - PK = 'artist' (must match base), SK = 'year'
+    # Global Secondary Index (GSI): 'YearTitleGSI' - PK = 'year', SK = 'title'
     if album:
         return _collect_scan_items(music_table)
 
-    if title:
-        exact_title = _collect_query_items(music_table, KeyConditionExpression=Key("title").eq(title))
-        if exact_title:
-            return exact_title
+    if artist and title:
+        try:
+            exact = _collect_query_items(
+                music_table,
+                KeyConditionExpression=Key("artist").eq(artist) & Key("title").eq(title)
+            )
+            if exact:
+                return exact
+        except ClientError:
+            pass
 
     if artist and year:
         try:
             exact_artist_year = _collect_query_items(
                 music_table,
-                IndexName="ArtistYearIndex",
+                IndexName="ArtistYearLSI",
                 KeyConditionExpression=Key("artist").eq(artist) & Key("year").eq(year),
             )
             if exact_artist_year:
@@ -203,11 +213,11 @@ def _fetch_music_candidates(title, artist, album, year):
         except ClientError:
             pass
 
-    if artist:
+    if admin_or_optim := artist:
+        # Fallback artist query
         try:
             exact_artist = _collect_query_items(
                 music_table,
-                IndexName="ArtistYearIndex",
                 KeyConditionExpression=Key("artist").eq(artist),
             )
             if exact_artist:
@@ -219,7 +229,7 @@ def _fetch_music_candidates(title, artist, album, year):
         try:
             exact_year = _collect_query_items(
                 music_table,
-                IndexName="YearTitleIndex",
+                IndexName="YearTitleGSI",
                 KeyConditionExpression=Key("year").eq(year),
             )
             if exact_year:
@@ -304,8 +314,47 @@ def _route_login(event):
         },
     )
 
+def _route_user_crud(event, method):
+    if method == "GET":
+        qs = _query_params(event)
+        email = _clean(qs.get("email"))
+        if not email:
+            return _response(event, 400, {"message": "email is required"})
+        user = users_table.get_item(Key={"email": email}).get("Item")
+        if not user:
+            return _response(event, 404, {"message": "User not found"})
+        return _response(event, 200, {"email": user.get("email"), "username": user.get("username")})
+    
+    elif method == "PUT":
+        data = _json_body(event)
+        email = _clean(data.get("email"))
+        username = _clean(data.get("username"))
+        password = _clean(data.get("password"))
+        if not email:
+            return _response(event, 400, {"message": "email is required"})
+        
+        user = users_table.get_item(Key={"email": email}).get("Item")
+        if not user:
+            return _response(event, 404, {"message": "User not found"})
+        
+        if username:
+            user["username"] = username
+            user["user_name"] = username
+        if password:
+            user["password"] = password
+            
+        users_table.put_item(Item=user)
+        return _response(event, 200, {"message": "User updated"})
 
-def _route_music(event):
+    elif method == "DELETE":
+        data = _json_body(event)
+        email = _clean(data.get("email") or _query_params(event).get("email"))
+        if not email:
+            return _response(event, 400, {"message": "email is required"})
+        users_table.delete_item(Key={"email": email})
+        return _response(event, 200, {"message": "User deleted"})
+
+def _route_music_read(event):
     qs = _query_params(event)
     title = _clean(qs.get("title"))
     artist = _clean(qs.get("artist"))
@@ -326,9 +375,52 @@ def _route_music(event):
     result = sorted(unique.values(), key=lambda x: (x["title"].lower(), x["artist"].lower(), x["year"]))
     return _response(event, 200, result)
 
+def _route_music_crud(event, method):
+    if method == "GET":
+        return _route_music_read(event)
+    
+    data = _json_body(event)
+    artist = _clean(data.get("artist") or _query_params(event).get("artist"))
+    title = _clean(data.get("title") or _query_params(event).get("title"))
+    
+    if not artist or not title:
+        return _response(event, 400, {"message": "artist and title are required for music CRUD"})
+        
+    if method == "POST":
+        year = _clean(data.get("year", ""))
+        album = _clean(data.get("album", ""))
+        music_table.put_item(
+            Item={
+                "artist": artist,
+                "title": title,
+                "year": year,
+                "album": album,
+                "song_id": _song_id(title, artist, year)
+            }
+        )
+        return _response(event, 201, {"message": "Music created"})
+        
+    elif method == "PUT":
+        song = music_table.get_item(Key={"artist": artist, "title": title}).get("Item")
+        if not song:
+            return _response(event, 404, {"message": "Music not found"})
+        
+        year = _clean(data.get("year"))
+        album = _clean(data.get("album"))
+        if year:
+            song["year"] = year
+        if album:
+            song["album"] = album
+            
+        music_table.put_item(Item=song)
+        return _response(event, 200, {"message": "Music updated"})
+        
+    elif method == "DELETE":
+        music_table.delete_item(Key={"artist": artist, "title": title})
+        return _response(event, 200, {"message": "Music deleted"})
 
 def _load_song_by_identity(title, artist, year):
-    response = music_table.get_item(Key={"title": title, "artist_year": f"{artist}#{year}"})
+    response = music_table.get_item(Key={"artist": artist, "title": title})
     return response.get("Item")
 
 
@@ -446,9 +538,12 @@ def lambda_handler(event, context):
 
         if path in {"/login", "/api/login"} and method == "POST":
             return _route_login(event)
+            
+        if path in {"/user", "/api/user"} and method in {"GET", "PUT", "DELETE"}:
+            return _route_user_crud(event, method)
 
-        if path in {"/music", "/api/music"} and method == "GET":
-            return _route_music(event)
+        if path in {"/music", "/api/music"}:
+            return _route_music_crud(event, method)
 
         if path in {"/subscription", "/subscriptions", "/api/subscriptions", "/subscribe"}:
             if method == "GET":
